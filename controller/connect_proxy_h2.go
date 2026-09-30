@@ -21,6 +21,8 @@ import (
 
 const (
 	http2ConnectIdleTimeout         = 90 * time.Second
+	http2ConnectReadIdleTimeout     = 15 * time.Second
+	http2ConnectPingTimeout         = 10 * time.Second
 	http2ConnectTLSHandshakeTimeout = 3 * time.Second
 	http2ConnectMaxResponseHeaders  = 16 << 10
 )
@@ -107,18 +109,31 @@ func newHTTP2ConnectManager(factory func(http2ConnectTransportKey) *xhttp2.Trans
 
 func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 	profile := key.tlsProfile
-	return &xhttp2.Transport{
+	transport := &xhttp2.Transport{
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: key.serverName,
 		},
-		DialTLSContext: func(ctx context.Context, network, address string, config *tls.Config) (net.Conn, error) {
-			return dialHTTP2TLS(ctx, network, address, config, profile)
+		DialTLSContext: func(ctx context.Context, network, address string, tlsConfig *tls.Config) (net.Conn, error) {
+			rule, _ := connectProxyRuleNameFromContext(ctx)
+			recordHandshake := metricConnectProxyHandshakeRecorder(rule, key.address, config.ConnectProxyH2)
+			connection, err := dialHTTP2TLS(ctx, network, address, tlsConfig, profile)
+			recordHandshake(connectProxyAttemptOutcome(err))
+			return connection, err
 		},
+		CountError:         metricConnectProxyH2ErrorCounter(key.address),
 		DisableCompression: true,
 		IdleConnTimeout:    http2ConnectIdleTimeout,
-		MaxHeaderListSize:  http2ConnectMaxResponseHeaders,
+		// Probe the physical H2 connection only after inbound frames stop.
+		// A lost PING closes its streams; later CONNECTs use a fresh connection.
+		ReadIdleTimeout:   http2ConnectReadIdleTimeout,
+		PingTimeout:       http2ConnectPingTimeout,
+		MaxHeaderListSize: http2ConnectMaxResponseHeaders,
 	}
+	// Per-connection transports keep CountError attribution separate while the
+	// outer transport retains HTTP/2 request handling and retry behavior.
+	transport.ConnPool = newHTTP2ConnectConnPool(transport)
+	return transport
 }
 
 // dialHTTP2TLS changes only the outer TLS ClientHello. HTTP/2 framing,
@@ -241,7 +256,7 @@ func (manager *http2ConnectManager) releaseTransport(key http2ConnectTransportKe
 	}
 	manager.mu.Unlock()
 	if closeTransport != nil {
-		closeTransport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(closeTransport)
 	}
 }
 
@@ -263,6 +278,12 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 
 	requestReader, requestWriter := io.Pipe()
 	streamCtx, cancelStream := context.WithCancel(context.Background())
+	// Retain only the bounded rule identity on the detached stream context.
+	// x/net passes it to a physical dial when needed; pooled reuse emits no
+	// handshake. Setup cancellation still leaves an established tunnel alive.
+	if rule, ok := connectProxyRuleNameFromContext(ctx); ok {
+		streamCtx = withConnectProxyRuleName(streamCtx, rule)
+	}
 	request := &http.Request{
 		Method:        http.MethodConnect,
 		URL:           &url.URL{Scheme: "https", Host: target.Address},
@@ -377,7 +398,7 @@ func (manager *http2ConnectManager) retire() {
 	}
 	manager.mu.Unlock()
 	for _, transport := range transports {
-		transport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(transport)
 	}
 }
 
@@ -389,8 +410,18 @@ func (manager *http2ConnectManager) closeIdle() {
 	}
 	manager.mu.Unlock()
 	for _, transport := range transports {
-		transport.CloseIdleConnections()
+		closeHTTP2ConnectIdleConnections(transport)
 	}
+}
+
+func closeHTTP2ConnectIdleConnections(transport *xhttp2.Transport) {
+	if pool, ok := transport.ConnPool.(*http2ConnectConnPool); ok {
+		// x/net's optional idle-closer interface uses a package-private method,
+		// so a pool implemented here must be closed explicitly by its manager.
+		pool.closeIdleConnections()
+		return
+	}
+	transport.CloseIdleConnections()
 }
 
 type tunnelAddr struct {

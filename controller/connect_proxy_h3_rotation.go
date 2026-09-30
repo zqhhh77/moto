@@ -142,12 +142,19 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 	if manager == nil || slot == nil || connection == nil || err != nil {
 		return
 	}
+	// Register before checking pool membership: Close may have removed the slot
+	// while its detached physical Dial was completing. A late connection must
+	// either become owned or be closed immediately, never escape both owners.
+	if !slot.ownPhysicalConnection(connection) {
+		return
+	}
 	now := manager.timeNow()
 	var closeCandidate *http3ConnectTransportSlot
 	var recovered func(http3ConnectTransportKey)
 	manager.mu.Lock()
 	if !manager.containsSlotLocked(key, slot) {
 		manager.mu.Unlock()
+		_ = connection.CloseWithError(0, "")
 		return
 	}
 	slot.connection = connection
@@ -157,6 +164,8 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 		manager.nextGenerationID++
 	}
 	slot.generationID = manager.nextGenerationID
+	observation := &http3ConnectionCloseObservation{generation: slot.generationID, establishedAt: now, logger: utils.Logger}
+	slot.closeObservation = observation
 	slot.remoteIP = http3RemoteIP(connection.RemoteAddr())
 	connectionID := slot.connectionID
 	slot.detector = newHTTP3DegradationDetector(now)
@@ -198,7 +207,10 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 
 	go func() {
 		<-connection.Context().Done()
-		manager.observeHTTP3ConnectionClosed(key, slot, connection, connectionID, context.Cause(connection.Context()))
+		cause := context.Cause(connection.Context())
+		manager.observeHTTP3ConnectionClosed(key, slot, connection, connectionID, cause)
+		// A slow diagnostic sink must not delay the existing failure callbacks.
+		manager.recordHTTP3ConnectionClose(key, slot, observation, cause)
 	}()
 }
 
@@ -401,7 +413,7 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 		slot.health = http3TransportDegraded
 		slot.rotationReason = decision.Reason
 		manager.recordHTTP3RotationEventLocked(snapshot.key, string(decision.Reason), "detected")
-		transition = &http3DegradationLogEvent{key: snapshot.key, decision: decision}
+		transition = &http3DegradationLogEvent{key: snapshot.key, decision: decision, generation: slot.generationID}
 		if firstDegradation {
 			if !manager.hasHealthyHTTP3ServingSlotLocked(snapshot.key) {
 				degraded = manager.onDegraded
@@ -445,7 +457,7 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	if err != nil {
 		manager.recordHTTP3RotationEventLocked(snapshot.key, string(decision.Reason), "candidate_failed")
 		if transition == nil {
-			transition = &http3DegradationLogEvent{key: snapshot.key, decision: decision, err: err}
+			transition = &http3DegradationLogEvent{key: snapshot.key, decision: decision, generation: slot.generationID, err: err}
 		} else {
 			transition.err = err
 		}
@@ -910,6 +922,7 @@ func (manager *http3ConnectManager) recordHTTP3RotationEventLocked(key http3Conn
 type http3DegradationLogEvent struct {
 	key              http3ConnectTransportKey
 	decision         http3DegradationDecision
+	generation       uint64
 	candidateCreated bool
 	err              error
 }
@@ -918,6 +931,7 @@ func logHTTP3DegradationTransition(event http3DegradationLogEvent) {
 	signals := event.decision.Signals
 	fields := []zap.Field{
 		zap.String("targetAddr", event.key.address),
+		zap.Uint64("generation", event.generation),
 		zap.String("reason", string(event.decision.Reason)),
 		zap.Duration("baselineRTT", signals.BaselineRTT),
 		zap.Duration("smoothedRTT", signals.SmoothedRTT),
@@ -934,6 +948,13 @@ func logHTTP3DegradationTransition(event http3DegradationLogEvent) {
 	}
 	if event.err != nil {
 		fields = append(fields, zap.Error(event.err))
+	}
+	if event.decision.Reason == http3DegradationReasonConnectionError && event.err == nil {
+		// The once-per-physical-connection event carries the actual close cause.
+		// Replacing an ended session is not another independent path failure.
+		utils.Logger.Debug("HTTP/3 已结束连接的替换候选状态",
+			append(fields, zap.Bool("candidateCreated", event.candidateCreated))...)
+		return
 	}
 	if event.err != nil {
 		utils.Logger.Warn("检测到 HTTP/3 连接持续退化，但轮换候选创建失败", fields...)

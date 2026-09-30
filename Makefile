@@ -7,9 +7,12 @@ STATICCHECK_VERSION ?= v0.7.0
 GOVULNCHECK_VERSION ?= v1.7.0
 ACTIONLINT_VERSION ?= v1.7.7
 CROSS_BUILD_DIR ?= bin/cross
+REGRESSION_COUNT ?= 10
+REGRESSION_SEED ?=
+REGRESSION_OUTPUT ?= bin/routing-regression
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build check ci fmt-check workflow-check mod-check test race fault-test vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
+.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
 
 build:
 	mkdir -p bin
@@ -20,6 +23,9 @@ fmt-check:
 
 workflow-check:
 	$(GO) run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) .github/workflows/*.yml
+
+release-check:
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/release_sbom_test.py
 
 mod-check:
 	$(GO) mod verify
@@ -32,7 +38,12 @@ race:
 	$(GO) test -race ./...
 
 fault-test:
-	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|FreshBoost|BoostProtocolCanary|DialBulkhead|Prewarm|ActiveHealth|HTTP3|.*ProtocolPenalty|SelectTargetsExcluding|.*TLS|.*ProxyProtocol|ServerClose)'
+	$(GO) test -race ./controller -shuffle=on -count=10 -run 'Test(ConcurrentReload|ReloadRules|RouteHealth|RaceBoostTargets|CachedBoost|FreshBoost|BoostProtocolCanary|DialBulkhead|Prewarm|ActiveHealth|HTTPConnect|HTTP2ConnectPing|HTTP3|.*ProtocolPenalty|SelectTargetsExcluding|.*TLS|.*ProxyProtocol|ServerClose)'
+
+# Pin critical Boost/cache/health/recovery/reload cases with evidence-checked
+# run/pass counts. The broader fault suite complements this fixed coverage.
+routing-regression:
+	$(PYTHON) -B test/routing_regression.py --go "$(GO)" --count "$(REGRESSION_COUNT)" --output "$(REGRESSION_OUTPUT)" $(if $(REGRESSION_SEED),--seed "$(REGRESSION_SEED)")
 
 vet:
 	$(GO) vet ./...
@@ -68,7 +79,13 @@ container-image-check: container-context-check
 
 bench-check:
 	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/bench.py", cfile=cache.name + "/bench.pyc", doraise=True); py_compile.compile("test/bulk_relay_bench.py", cfile=cache.name + "/bulk_relay_bench.pyc", doraise=True); py_compile.compile("test/moto-route-watch.py", cfile=cache.name + "/moto-route-watch.pyc", doraise=True)'
-	$(PYTHON) test/moto_route_watch_test.py
+	$(PYTHON) -c 'import py_compile, tempfile; cache = tempfile.TemporaryDirectory(); py_compile.compile("test/http_connect_smoke.py", cfile=cache.name + "/http_connect_smoke.pyc", doraise=True); py_compile.compile("test/connect_route_smoke.py", cfile=cache.name + "/connect_route_smoke.pyc", doraise=True)'
+	$(PYTHON) -B test/moto_route_watch_test.py
+	$(PYTHON) -B test/http_connect_smoke_test.py
+	$(PYTHON) -B test/connect_route_smoke_test.py
+	$(PYTHON) -B test/routing_regression_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B test/h2_timing_matrix_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) -B test/h2_timing_origin_test.py
 
 bench-smoke:
 	$(PYTHON) test/bench.py --self-contained --mode normal -c 4 -t 12 --warmup 4 --timeout 2 --min-success-rate 100 --min-warm-throughput-ratio 0.02 --max-warm-p95-ms 500
@@ -84,6 +101,6 @@ cross-build:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-darwin-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-windows-amd64.exe .
 
-check: fmt-check workflow-check mod-check test race fault-test vet staticcheck vuln config-check container-context-check bench-check bench-smoke
+check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check bench-check bench-smoke
 
 ci: check cross-build

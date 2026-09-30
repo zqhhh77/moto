@@ -31,10 +31,16 @@ type prewarmGauge struct {
 }
 
 type activeHealthGauge struct {
-	rule      string
-	mode      string
-	target    string
-	unhealthy bool
+	rule              string
+	mode              string
+	target            string
+	unhealthy         bool
+	recoverySuccesses int
+	requiredSuccesses int
+	nextProbeAt       time.Time
+	probeInFlight     bool
+	lastProbeSuccess  time.Time
+	lastRecovery      time.Time
 }
 
 // http3TransportGauge is an aggregate over physical QUIC transports with the
@@ -76,6 +82,7 @@ type http3PolicyGauge struct {
 
 type http3GaugeSnapshot struct {
 	transports   []http3TransportGauge
+	closures     []http3ConnectionCloseGauge
 	rotations    []http3RotationGauge
 	policies     []http3PolicyGauge
 	ruleBreakers []http3RuleBreakerGauge
@@ -167,7 +174,31 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 
 	writeMetricHeader(output, "moto_active_health_unhealthy", "Whether a target is excluded by threshold-confirmed active health checks.", "gauge")
 	for _, target := range activeHealth {
-		writeMetricSample(output, "moto_active_health_unhealthy", []prometheusLabel{{"rule", target.rule}, {"mode", target.mode}, {"target", target.target}}, boolMetric(target.unhealthy))
+		writeMetricSample(output, "moto_active_health_unhealthy", activeHealthGaugeLabels(target), boolMetric(target.unhealthy))
+	}
+	writeMetricHeader(output, "moto_active_health_recovery_successes", "Consecutive successful active probes toward recovery while unhealthy; zero when healthy.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_recovery_successes", activeHealthGaugeLabels(target), strconv.Itoa(target.recoverySuccesses))
+	}
+	writeMetricHeader(output, "moto_active_health_recovery_required_successes", "Configured consecutive successful active probes required to recover an unhealthy target.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_recovery_required_successes", activeHealthGaugeLabels(target), strconv.Itoa(target.requiredSuccesses))
+	}
+	writeMetricHeader(output, "moto_active_health_next_probe_timestamp_seconds", "Unix timestamp of the scheduled active probe, including overdue capacity waits; zero while probing or stopped.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_next_probe_timestamp_seconds", activeHealthGaugeLabels(target), activeHealthTimestampMetric(target.nextProbeAt))
+	}
+	writeMetricHeader(output, "moto_active_health_probe_in_flight", "Whether an active probe is currently holding process-wide probe capacity.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_probe_in_flight", activeHealthGaugeLabels(target), boolMetric(target.probeInFlight))
+	}
+	writeMetricHeader(output, "moto_active_health_last_probe_success_timestamp_seconds", "Unix timestamp of the latest completed successful active probe; zero until one succeeds.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_last_probe_success_timestamp_seconds", activeHealthGaugeLabels(target), activeHealthTimestampMetric(target.lastProbeSuccess))
+	}
+	writeMetricHeader(output, "moto_active_health_last_recovery_timestamp_seconds", "Unix timestamp of the latest threshold-confirmed transition from actively unhealthy to healthy; zero until one occurs.", "gauge")
+	for _, target := range activeHealth {
+		writeMetricSample(output, "moto_active_health_last_recovery_timestamp_seconds", activeHealthGaugeLabels(target), activeHealthTimestampMetric(target.lastRecovery))
 	}
 
 	writeMetricHeader(output, "moto_dial_bulkhead_in_flight", "Foreground network dials currently holding capacity.", "gauge")
@@ -183,6 +214,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 		writeMetricSample(output, "moto_dial_bulkhead_target_in_flight", []prometheusLabel{{"target", target}}, strconv.Itoa(dialCapacity.ActiveByTarget[target]))
 	}
 
+	renderHTTP3CloseMetrics(output, http3.closures)
 	writeMetricHeader(output, "moto_connect_proxy_h3_transports", "Physical HTTP/3 transports in the current routing generation by configured proxy target and state.", "gauge")
 	for _, transport := range http3.transports {
 		writeMetricSample(output, "moto_connect_proxy_h3_transports", http3TransportGaugeLabels(transport), strconv.Itoa(transport.transports))
@@ -298,6 +330,7 @@ func (runtime *routingRuntime) renderOperationalGauges(output *strings.Builder) 
 			writeMetricSample(output, "moto_connect_proxy_h3_rule_breaker_events", []prometheusLabel{{"rule", rule.rule}, {"outcome", outcome}}, strconv.FormatUint(rule.events[outcome], 10))
 		}
 	}
+	writeHTTP3RecoveryGauges(output, http3.ruleBreakers)
 }
 
 func snapshotHTTP3Gauges(manager *connectProxyManager) http3GaugeSnapshot {
@@ -408,6 +441,9 @@ func (manager *http3ConnectManager) snapshotGauges() http3GaugeSnapshot {
 		transports: make([]http3TransportGauge, 0, len(aggregates)),
 		rotations:  make([]http3RotationGauge, 0, len(manager.rotationEvents)),
 	}
+	for key, count := range manager.closeEvents {
+		snapshot.closures = append(snapshot.closures, http3ConnectionCloseGauge{target: key.target, reason: key.reason, count: count})
+	}
 	for _, aggregate := range aggregates {
 		snapshot.transports = append(snapshot.transports, *aggregate)
 	}
@@ -431,6 +467,7 @@ func (manager *http3ConnectManager) snapshotGauges() http3GaugeSnapshot {
 		}
 		return left.health < right.health
 	})
+	sortHTTP3CloseMetrics(snapshot.closures)
 	sort.Slice(snapshot.rotations, func(i, j int) bool {
 		left, right := snapshot.rotations[i], snapshot.rotations[j]
 		if left.target != right.target {
@@ -458,11 +495,21 @@ func snapshotActiveHealthGauges(manager *activeHealthManager) []activeHealthGaug
 		if key.rule == nil || state == nil {
 			continue
 		}
+		progress := 0
+		if state.unhealthy {
+			progress = state.consecutiveSuccesses
+		}
 		snapshots = append(snapshots, activeHealthGauge{
-			rule:      key.rule.Name,
-			mode:      key.rule.Mode,
-			target:    key.address,
-			unhealthy: state.unhealthy,
+			rule:              key.rule.Name,
+			mode:              key.rule.Mode,
+			target:            key.address,
+			unhealthy:         state.unhealthy,
+			recoverySuccesses: progress,
+			requiredSuccesses: state.requiredSuccesses,
+			nextProbeAt:       state.nextProbeAt,
+			probeInFlight:     state.probeInFlight,
+			lastProbeSuccess:  state.lastProbeSuccess,
+			lastRecovery:      state.lastRecovery,
 		})
 	}
 	manager.mu.RUnlock()
@@ -476,6 +523,18 @@ func snapshotActiveHealthGauges(manager *activeHealthManager) []activeHealthGaug
 		return snapshots[i].target < snapshots[j].target
 	})
 	return snapshots
+}
+
+func activeHealthGaugeLabels(target activeHealthGauge) []prometheusLabel {
+	return []prometheusLabel{{"rule", target.rule}, {"mode", target.mode}, {"target", target.target}}
+}
+
+func activeHealthTimestampMetric(timestamp time.Time) string {
+	if timestamp.IsZero() {
+		return "0"
+	}
+	seconds := float64(timestamp.Unix()) + float64(timestamp.Nanosecond())/float64(time.Second)
+	return strconv.FormatFloat(seconds, 'f', -1, 64)
 }
 
 func routeGaugeLabels(route routeGauge) []prometheusLabel {

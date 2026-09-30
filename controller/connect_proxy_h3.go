@@ -50,12 +50,15 @@ type http3AddressResolver interface {
 }
 
 type http3ConnectTransportSlot struct {
-	transport    *http3.Transport
-	setupFlights *http3SetupFlightTracker
-	cancelSetup  context.CancelFunc
-	closeOnce    sync.Once
-	active       int
-	limit        int
+	transport      *http3.Transport
+	setupFlights   *http3SetupFlightTracker
+	cancelSetup    context.CancelFunc
+	closeOnce      sync.Once
+	closeRequested atomic.Bool
+	physicalMu     sync.Mutex
+	physicalConns  map[*quic.Conn]struct{}
+	active         int
+	limit          int
 
 	lifecycle          http3TransportLifecycle
 	health             http3TransportHealth
@@ -63,6 +66,7 @@ type http3ConnectTransportSlot struct {
 	connectionID       uint64
 	generationID       uint64
 	remoteIP           string
+	closeObservation   *http3ConnectionCloseObservation
 	detector           *http3DegradationDetector
 	lastDecision       http3DegradationDecision
 	replaces           *http3ConnectTransportSlot
@@ -89,12 +93,14 @@ func (slot *http3ConnectTransportSlot) close() {
 		return
 	}
 	slot.closeOnce.Do(func() {
+		slot.closeRequested.Store(true)
 		// quic-go's Transport.Close waits for an in-flight Dial to return. Cancel
 		// the slot-owned physical setup first so retire/reload cannot wait for the
 		// entire handshake budget after the last logical user has gone away.
 		if slot.cancelSetup != nil {
 			slot.cancelSetup()
 		}
+		slot.closePhysicalConnections()
 		if slot.transport != nil {
 			_ = slot.transport.Close()
 		}
@@ -166,6 +172,7 @@ type http3ConnectManager struct {
 	now                  func() time.Time
 	healthyRTT           map[http3ConnectTransportKey]time.Duration
 	rotationEvents       map[http3RotationMetricKey]uint64
+	closeEvents          map[http3ConnectionCloseMetricKey]uint64
 	samplerCancel        context.CancelFunc
 	samplerDone          chan struct{}
 	onDegraded           func(http3ConnectTransportKey, http3DegradationReason)
@@ -192,6 +199,7 @@ func newHTTP3ConnectManager(factory func(http3ConnectTransportKey, context.Conte
 		now:                 time.Now,
 		healthyRTT:          make(map[http3ConnectTransportKey]time.Duration),
 		rotationEvents:      make(map[http3RotationMetricKey]uint64),
+		closeEvents:         make(map[http3ConnectionCloseMetricKey]uint64),
 	}
 }
 
@@ -554,6 +562,11 @@ func (manager *http3ConnectManager) releaseTransport(
 	}
 	if slot.active == 0 {
 		remove := manager.retired || slot.lifecycle == http3TransportDraining || slot.lifecycle == http3TransportFailed
+		// Concurrent RoundTrips may have redialed before an earlier error was
+		// observed, including an error racing with caller cancellation. Once all
+		// logical users leave, retire the whole slot instead of retaining hidden
+		// idle physical connections behind the Transport's current cache entry.
+		remove = remove || slot.hasMultiplePhysicalConnections()
 		if slot.lifecycle == http3TransportServing && !remove {
 			for _, candidate := range manager.transports[key] {
 				if candidate != nil && candidate != slot && candidate.lifecycle == http3TransportServing {
@@ -759,6 +772,9 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		var candidateRetrySource *http3ConnectTransportSlot
 		if candidateAttempt && ctx.Err() == nil {
 			candidateRetrySource, candidateFailed = manager.markHTTP3CandidateFailed(key, transportSlot, setupErr)
+		}
+		if ctx.Err() == nil && streamCtx.Err() == nil {
+			manager.drainHTTP3ErroredTransport(key, transportSlot)
 		}
 		releaseTransport()
 		cancelStream()
