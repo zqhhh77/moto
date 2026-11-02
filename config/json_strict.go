@@ -14,7 +14,7 @@ var (
 	configRuleFields     = stringSet(
 		"name", "listen", "mode", "protocol", "prewarm", "targets", "timeout",
 		"blacklist", "allowlist", "maxConnections", "maxConnectionsPerIP",
-		"healthCheck", "hedge", "proxyProtocol", "userAgent",
+		"healthCheck", "hedge", "proxyProtocol",
 	)
 	configTargetFields       = stringSet("regexp", "address", "serverNames", "alpn", "connectProxy")
 	configConnectProxyFields = stringSet("protocols", "serverName", "basicAuth")

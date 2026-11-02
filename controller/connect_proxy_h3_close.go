@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"errors"
-	"moto/utils"
 	"net"
 	"sort"
 	"strconv"
@@ -11,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 )
@@ -135,7 +134,7 @@ func (manager *http3ConnectManager) recordHTTP3ConnectionClose(
 		}
 		logger := observation.logger
 		if logger == nil {
-			logger = utils.Logger
+			logger = manager.logger
 		}
 		logger.Log(level, "HTTP/3 物理连接已结束", fields...)
 	})

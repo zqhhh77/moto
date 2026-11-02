@@ -66,8 +66,6 @@ const (
 	maxTLSMatchers      = 64
 	maxConfigFileBytes  = 16 << 20
 	maxBasicCredential  = 4 << 10
-	maxUserAgents       = 64
-	maxUserAgentBytes   = 1024
 )
 
 var validLogLevels = map[string]struct{}{
@@ -198,7 +196,6 @@ type Rule struct {
 	HealthCheck         *HealthCheckConfig   `json:"healthCheck,omitempty"`
 	Hedge               *HedgeConfig         `json:"hedge,omitempty"`
 	ProxyProtocol       *ProxyProtocolConfig `json:"proxyProtocol,omitempty"`
-	UserAgent           []string             `json:"userAgent,omitempty"`
 
 	allowPrefixes []netip.Prefix
 	blockedIPs    map[netip.Addr]struct{}
@@ -444,14 +441,6 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 	if _, ok := validProtocols[r.Protocol]; !ok {
 		return fmt.Errorf("invalid protocol %q", r.Protocol)
 	}
-	if len(r.UserAgent) != 0 {
-		if !IsConnectProtocol(r.Protocol) {
-			return errors.New("userAgent is only valid for protocol socks5 or http")
-		}
-		if err := validateUserAgents(r.UserAgent); err != nil {
-			return err
-		}
-	}
 	if IsConnectProtocol(r.Protocol) {
 		if r.Mode == ModeRegex || r.Mode == ModeTLS {
 			return fmt.Errorf("protocol %q is not compatible with mode %q", r.Protocol, r.Mode)
@@ -613,31 +602,6 @@ func (r *Rule) validate(allowEphemeralListen bool) error {
 		}
 	}
 	r.blockedIPs = blocked
-	return nil
-}
-
-func validateUserAgents(userAgents []string) error {
-	if len(userAgents) > maxUserAgents {
-		return fmt.Errorf("userAgent must not contain more than %d entries", maxUserAgents)
-	}
-	seen := make(map[string]struct{}, len(userAgents))
-	for index, userAgent := range userAgents {
-		if len(userAgent) == 0 || len(userAgent) > maxUserAgentBytes {
-			return fmt.Errorf("userAgent[%d] length must be between 1 and %d bytes", index, maxUserAgentBytes)
-		}
-		if userAgent != strings.TrimSpace(userAgent) {
-			return fmt.Errorf("userAgent[%d] must not have leading or trailing whitespace", index)
-		}
-		for _, value := range []byte(userAgent) {
-			if value < 0x20 || value > 0x7e {
-				return fmt.Errorf("userAgent[%d] must contain only printable ASCII", index)
-			}
-		}
-		if _, duplicate := seen[userAgent]; duplicate {
-			return fmt.Errorf("userAgent[%d]: duplicate value", index)
-		}
-		seen[userAgent] = struct{}{}
-	}
 	return nil
 }
 

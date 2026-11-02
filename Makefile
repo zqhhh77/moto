@@ -3,7 +3,7 @@ PYTHON ?= python3
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT ?= $(shell git rev-parse HEAD 2>/dev/null || echo unknown)
 BUILD_DATE ?= $(shell git show -s --format=%cI HEAD 2>/dev/null || echo unknown)
-STATICCHECK_VERSION ?= v0.7.0
+STATICCHECK_BIN := $(abspath bin/tools/staticcheck)
 GOVULNCHECK_VERSION ?= v1.7.0
 ACTIONLINT_VERSION ?= v1.7.7
 CROSS_BUILD_DIR ?= bin/cross
@@ -12,7 +12,7 @@ REGRESSION_SEED ?=
 REGRESSION_OUTPUT ?= bin/routing-regression
 LDFLAGS := -s -w -buildid= -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.buildDate=$(BUILD_DATE)
 
-.PHONY: build check ci fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
+.PHONY: build check ci fmt-check workflow-check release-check mod-check dependency-boundary-check upstream-vuln test race fault-test routing-regression browser-profile-check transport-regression-check vet staticcheck vuln config-check container-context-check container-image-check bench-check bench-smoke cross-build
 
 build:
 	mkdir -p bin
@@ -26,10 +26,19 @@ workflow-check:
 
 release-check:
 	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/release_sbom_test.py
+	PYTHONDONTWRITEBYTECODE=1 $(PYTHON) test/release_workflow_test.py
 
 mod-check:
 	$(GO) mod verify
 	$(GO) mod tidy -diff
+	$(PYTHON) internal/browserhttp2/update_upstream.py --check --zip "$$( $(GO) env GOMODCACHE )/cache/download/golang.org/x/net/@v/v0.60.0.zip"
+
+dependency-boundary-check:
+	$(PYTHON) -B scripts/dependency_security.py check --go "$(GO)"
+	$(PYTHON) -B test/dependency_security_test.py
+
+upstream-vuln:
+	$(PYTHON) -B scripts/dependency_security.py query --go "$(GO)"
 
 test:
 	$(GO) test ./...
@@ -45,11 +54,33 @@ fault-test:
 routing-regression:
 	$(PYTHON) -B test/routing_regression.py --go "$(GO)" --count "$(REGRESSION_COUNT)" --output "$(REGRESSION_OUTPUT)" $(if $(REGRESSION_SEED),--seed "$(REGRESSION_SEED)")
 
+# Compare actual loopback Moto bytes with a captured, fixed Chrome baseline.
+# No browser or upstream credentials; test traffic stays on loopback.
+browser-profile-check:
+	$(PYTHON) -B test/test_browser_profile_compare.py
+	$(PYTHON) -B test/test_browser_profile_regression.py
+	$(PYTHON) -B test/browser_profile_regression.py --go "$(GO)" --protocol h2 --scenario all --samples 3
+
+# Keep detailed comparison output local while preserving the regression gate.
+transport-regression-check:
+	@log="$$(mktemp "$${TMPDIR:-/tmp}/moto-transport-regression.XXXXXX")" || exit 1; \
+	trap 'rm -f "$$log"' 0; \
+	if $(MAKE) --no-print-directory browser-profile-check >"$$log" 2>&1; then \
+		echo "Transport regression checks passed."; \
+	else \
+		echo "Transport regression checks failed. Reproduce locally with make browser-profile-check." >&2; \
+		exit 1; \
+	fi
+
 vet:
 	$(GO) vet ./...
 
 staticcheck:
-	$(GO) run honnef.co/go/tools/cmd/staticcheck@$(STATICCHECK_VERSION) ./...
+	$(GO) -C tools/staticcheck mod verify
+	$(GO) -C tools/staticcheck mod tidy -diff
+	mkdir -p bin/tools
+	$(GO) -C tools/staticcheck build -mod=readonly -trimpath -o "$(STATICCHECK_BIN)" honnef.co/go/tools/cmd/staticcheck
+	"$(STATICCHECK_BIN)" ./...
 
 vuln:
 	$(GO) run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
@@ -101,6 +132,6 @@ cross-build:
 	CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-darwin-arm64 .
 	CGO_ENABLED=0 GOOS=windows GOARCH=amd64 $(GO) build -trimpath -buildvcs=false -o $(CROSS_BUILD_DIR)/moto-windows-amd64.exe .
 
-check: fmt-check workflow-check release-check mod-check test race fault-test routing-regression vet staticcheck vuln config-check container-context-check bench-check bench-smoke
+check: fmt-check workflow-check release-check dependency-boundary-check mod-check test race fault-test routing-regression transport-regression-check vet staticcheck vuln upstream-vuln config-check container-context-check bench-check bench-smoke
 
 ci: check cross-build

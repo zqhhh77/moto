@@ -5,11 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"moto/config"
-	"moto/utils"
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
+	"github.com/apernet/quic-go"
 	"go.uber.org/zap"
 )
 
@@ -51,7 +50,6 @@ type http3TunnelStats struct {
 	ruleName            string
 	target              *config.Target
 	destination         string
-	userAgent           string
 	probation           http3RuleProbationBinding
 	pending             atomic.Int64
 	writeStarted        atomic.Int64
@@ -70,7 +68,6 @@ type http3UDPBlackholeProbe struct {
 	ruleName    string
 	target      *config.Target
 	destination string
-	userAgent   string
 }
 
 type http3UDPBlackholeEvent struct {
@@ -164,7 +161,7 @@ func (manager *http3ConnectManager) observeHTTP3PhysicalDial(
 		manager.nextGenerationID++
 	}
 	slot.generationID = manager.nextGenerationID
-	observation := &http3ConnectionCloseObservation{generation: slot.generationID, establishedAt: now, logger: utils.Logger}
+	observation := &http3ConnectionCloseObservation{generation: slot.generationID, establishedAt: now, logger: manager.logger}
 	slot.closeObservation = observation
 	slot.remoteIP = http3RemoteIP(connection.RemoteAddr())
 	connectionID := slot.connectionID
@@ -448,7 +445,6 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 					ruleName:    tunnel.ruleName,
 					target:      tunnel.target,
 					destination: tunnel.destination,
-					userAgent:   tunnel.userAgent,
 				})
 			}
 		}
@@ -472,7 +468,7 @@ func (manager *http3ConnectManager) applyHTTP3DegradationSample(
 	}
 	manager.mu.Unlock()
 	if transition != nil {
-		logHTTP3DegradationTransition(*transition)
+		manager.logHTTP3DegradationTransition(*transition)
 	}
 	if degraded != nil {
 		degraded(snapshot.key, transition.decision.Reason)
@@ -671,12 +667,12 @@ func (manager *http3ConnectManager) markHTTP3CandidateFailed(
 	retryAfter := http3RotationBackoff(max(1, sourceRotationFailures(source)))
 	manager.mu.Unlock()
 	if retrySource != nil {
-		utils.Logger.Warn("HTTP/3 轮换候选建立失败，继续使用旧连接",
+		manager.logger.Warn("HTTP/3 轮换候选建立失败，继续使用旧连接",
 			zap.String("targetAddr", key.address),
 			zap.Duration("retryAfter", retryAfter),
 			zap.Error(cause))
 	} else {
-		utils.Logger.Warn("HTTP/3 轮换候选建立失败，旧连接已不可复用",
+		manager.logger.Warn("HTTP/3 轮换候选建立失败，旧连接已不可复用",
 			zap.String("targetAddr", key.address),
 			zap.Error(cause))
 	}
@@ -748,7 +744,7 @@ func (manager *http3ConnectManager) promoteHTTP3Candidate(
 		recovered(key)
 		manager.observerMu.Unlock()
 	}
-	utils.Logger.Info("HTTP/3 退化连接已平滑轮换",
+	manager.logger.Info("HTTP/3 退化连接已平滑轮换",
 		zap.String("targetAddr", key.address),
 		zap.String("newState", string(newState)),
 		zap.String("oldState", string(http3TransportDraining)))
@@ -927,7 +923,7 @@ type http3DegradationLogEvent struct {
 	err              error
 }
 
-func logHTTP3DegradationTransition(event http3DegradationLogEvent) {
+func (manager *http3ConnectManager) logHTTP3DegradationTransition(event http3DegradationLogEvent) {
 	signals := event.decision.Signals
 	fields := []zap.Field{
 		zap.String("targetAddr", event.key.address),
@@ -952,19 +948,19 @@ func logHTTP3DegradationTransition(event http3DegradationLogEvent) {
 	if event.decision.Reason == http3DegradationReasonConnectionError && event.err == nil {
 		// The once-per-physical-connection event carries the actual close cause.
 		// Replacing an ended session is not another independent path failure.
-		utils.Logger.Debug("HTTP/3 已结束连接的替换候选状态",
+		manager.logger.Debug("HTTP/3 已结束连接的替换候选状态",
 			append(fields, zap.Bool("candidateCreated", event.candidateCreated))...)
 		return
 	}
 	if event.err != nil {
-		utils.Logger.Warn("检测到 HTTP/3 连接持续退化，但轮换候选创建失败", fields...)
+		manager.logger.Warn("检测到 HTTP/3 连接持续退化，但轮换候选创建失败", fields...)
 		return
 	}
 	if event.candidateCreated {
-		utils.Logger.Warn("检测到 HTTP/3 连接持续退化，已创建单个轮换候选", fields...)
+		manager.logger.Warn("检测到 HTTP/3 连接持续退化，已创建单个轮换候选", fields...)
 		return
 	}
-	utils.Logger.Warn("检测到 HTTP/3 连接持续退化，轮换候选暂缓创建", fields...)
+	manager.logger.Warn("检测到 HTTP/3 连接持续退化，轮换候选暂缓创建", fields...)
 }
 
 func (manager *http3ConnectManager) validateHTTP3RotationState() error {

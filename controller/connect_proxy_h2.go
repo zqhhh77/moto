@@ -8,15 +8,14 @@ import (
 	"fmt"
 	"io"
 	"moto/config"
+	xhttp2 "moto/internal/browserhttp2"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
 	"sync"
 	"time"
 
 	utls "github.com/refraction-networking/utls"
-	xhttp2 "golang.org/x/net/http2"
 )
 
 const (
@@ -30,62 +29,6 @@ const (
 type http2ConnectTransportKey struct {
 	address    string
 	serverName string
-	userAgent  string
-	tlsProfile http2TLSClientHelloProfile
-}
-
-type http2TLSClientHelloProfile uint8
-
-const (
-	http2TLSProfileChrome133 http2TLSClientHelloProfile = iota
-	http2TLSProfileFirefox120
-	http2TLSProfileSafari160
-	http2TLSProfileIOS14
-)
-
-func http2TLSProfileForUserAgent(userAgent string) http2TLSClientHelloProfile {
-	normalized := strings.ToLower(strings.TrimSpace(userAgent))
-	switch {
-	case strings.Contains(normalized, "iphone"),
-		strings.Contains(normalized, "ipad"),
-		strings.Contains(normalized, "crios/"),
-		strings.Contains(normalized, "fxios/"),
-		strings.Contains(normalized, "edgios/"):
-		return http2TLSProfileIOS14
-	case strings.Contains(normalized, "edg/"),
-		strings.Contains(normalized, "edga/"):
-		// Chromium-based Edge uses the current Chrome profile. The Edge
-		// markers must be checked before Chrome because its UA contains both.
-		return http2TLSProfileChrome133
-	case strings.Contains(normalized, "firefox/"):
-		return http2TLSProfileFirefox120
-	case strings.Contains(normalized, "chrome/"),
-		strings.Contains(normalized, "chromium/"):
-		return http2TLSProfileChrome133
-	case strings.Contains(normalized, "macintosh") &&
-		strings.Contains(normalized, "version/") &&
-		strings.Contains(normalized, "safari/") &&
-		!strings.Contains(normalized, "chrome/") &&
-		!strings.Contains(normalized, "chromium/") &&
-		!strings.Contains(normalized, "edg/") &&
-		!strings.Contains(normalized, "opr/"):
-		return http2TLSProfileSafari160
-	default:
-		return http2TLSProfileChrome133
-	}
-}
-
-func (profile http2TLSClientHelloProfile) clientHelloID() utls.ClientHelloID {
-	switch profile {
-	case http2TLSProfileFirefox120:
-		return utls.HelloFirefox_120
-	case http2TLSProfileSafari160:
-		return utls.HelloSafari_16_0
-	case http2TLSProfileIOS14:
-		return utls.HelloIOS_14
-	default:
-		return utls.HelloChrome_133
-	}
 }
 
 type http2ConnectManager struct {
@@ -108,8 +51,8 @@ func newHTTP2ConnectManager(factory func(http2ConnectTransportKey) *xhttp2.Trans
 }
 
 func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
-	profile := key.tlsProfile
 	transport := &xhttp2.Transport{
+		ChromeProfile: true,
 		TLSClientConfig: &tls.Config{
 			MinVersion: tls.VersionTLS12,
 			ServerName: key.serverName,
@@ -117,7 +60,7 @@ func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 		DialTLSContext: func(ctx context.Context, network, address string, tlsConfig *tls.Config) (net.Conn, error) {
 			rule, _ := connectProxyRuleNameFromContext(ctx)
 			recordHandshake := metricConnectProxyHandshakeRecorder(rule, key.address, config.ConnectProxyH2)
-			connection, err := dialHTTP2TLS(ctx, network, address, tlsConfig, profile)
+			connection, err := dialHTTP2TLS(ctx, network, address, tlsConfig)
 			recordHandshake(connectProxyAttemptOutcome(err))
 			return connection, err
 		},
@@ -136,15 +79,15 @@ func newHTTP2ConnectTransport(key http2ConnectTransportKey) *xhttp2.Transport {
 	return transport
 }
 
-// dialHTTP2TLS changes only the outer TLS ClientHello. HTTP/2 framing,
-// CONNECT headers, pooling, and stream behavior remain owned by x/net/http2.
+// dialHTTP2TLS always uses the pinned Chrome ClientHello. HTTP/2 framing,
+// CONNECT headers, pooling, and stream behavior remain owned by the
+// browser-compatible HTTP/2 transport.
 // Certificate-chain and hostname verification stay enabled through uTLS.
 func dialHTTP2TLS(
 	ctx context.Context,
 	network string,
 	address string,
 	config *tls.Config,
-	profile http2TLSClientHelloProfile,
 ) (net.Conn, error) {
 	if ctx == nil {
 		ctx = context.Background()
@@ -163,7 +106,7 @@ func dialHTTP2TLS(
 	handshakeCtx, cancelHandshake := context.WithTimeout(ctx, http2ConnectTLSHandshakeTimeout)
 	defer cancelHandshake()
 
-	connection := utls.UClient(rawConnection, utlsConfig, profile.clientHelloID())
+	connection := utls.UClient(rawConnection, utlsConfig, utls.HelloChrome_133)
 	if err := connection.HandshakeContext(handshakeCtx); err != nil {
 		_ = rawConnection.Close()
 		return nil, err
@@ -182,7 +125,6 @@ func newHTTP2UTLSConfig(config *tls.Config) (*utls.Config, error) {
 		return nil, errors.New("HTTP/2 TLS crypto/tls VerifyConnection callback is unsupported")
 	}
 	return &utls.Config{
-		Rand:                        config.Rand,
 		Time:                        config.Time,
 		RootCAs:                     config.RootCAs,
 		ServerName:                  config.ServerName,
@@ -267,17 +209,16 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 	if target == nil || target.ConnectProxy == nil {
 		return nil, errors.New("HTTP/2 CONNECT target is not configured")
 	}
-	userAgent, hasUserAgent := connectProxyUserAgentFromContext(ctx)
 	key := http2ConnectTransportKey{
 		address:    target.Address,
 		serverName: target.ConnectProxy.ServerName,
-		userAgent:  userAgent,
-		tlsProfile: http2TLSProfileForUserAgent(userAgent),
 	}
 	transport, releaseTransport := manager.acquireTransport(key)
 
 	requestReader, requestWriter := io.Pipe()
 	streamCtx, cancelStream := context.WithCancel(context.Background())
+	setupWaiter := &http2SetupWaiter{}
+	streamCtx = withHTTP2SetupWaiter(streamCtx, setupWaiter)
 	// Retain only the bounded rule identity on the detached stream context.
 	// x/net passes it to a physical dial when needed; pooled reuse emits no
 	// handshake. Setup cancellation still leaves an established tunnel alive.
@@ -297,9 +238,7 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 		token := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
 		request.Header.Set("Proxy-Authorization", "Basic "+token)
 	}
-	if hasUserAgent {
-		request.Header.Set("User-Agent", userAgent)
-	}
+	request.Header.Set("User-Agent", connectProxyChromeUserAgent)
 
 	type roundTripResult struct {
 		response *http.Response
@@ -323,7 +262,7 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 		case result := <-resultReady:
 			response, err = result.response, result.err
 		default:
-			setupErr := ctx.Err()
+			setupErr := http2SetupCallerError(setupWaiter, nil, ctx.Err())
 			cancelStream()
 			_ = requestWriter.CloseWithError(setupErr)
 			_ = requestReader.CloseWithError(setupErr)
@@ -338,12 +277,7 @@ func (manager *http2ConnectManager) dial(ctx context.Context, target *config.Tar
 		}
 	}
 	if err != nil {
-		setupErr := err
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Preserve the caller's deadline/cancellation cause for route health
-			// and protocol metrics instead of returning context.Canceled blindly.
-			setupErr = ctxErr
-		}
+		setupErr := http2SetupCallerError(setupWaiter, err, ctx.Err())
 		cancelStream()
 		_ = requestWriter.CloseWithError(setupErr)
 		_ = requestReader.CloseWithError(setupErr)

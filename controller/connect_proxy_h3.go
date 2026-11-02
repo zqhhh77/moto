@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"moto/config"
+	"moto/utils"
 	"net"
 	"net/http"
 	"net/http/httptrace"
@@ -17,17 +18,20 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/quic-go/quic-go"
-	"github.com/quic-go/quic-go/http3"
+	"github.com/apernet/quic-go"
+	"github.com/apernet/quic-go/http3"
+	"go.uber.org/zap"
 )
 
 const (
 	// This is a defensive cap for one physical DNS+QUIC setup. The configured
 	// rule/attempt deadline remains authoritative whenever it is shorter.
 	http3ConnectMaxHandshakeTimeout = 30 * time.Second
-	http3ConnectIdleTimeout         = 90 * time.Second
-	http3ConnectKeepAlivePeriod     = 10 * time.Second
-	http3ConnectMaxResponseHeaders  = 16 << 10
+	// Match the fixed Chrome transport parameters; keepalive remains shorter
+	// so quiet established CONNECT tunnels do not expire at this boundary.
+	http3ConnectIdleTimeout        = 30 * time.Second
+	http3ConnectKeepAlivePeriod    = 10 * time.Second
+	http3ConnectMaxResponseHeaders = 16 << 10
 	// Stay below common peer-controlled bidirectional stream ceilings and
 	// open another pooled QUIC connection before a long CONNECT can consume all
 	// stream credit. The pool remains bounded at the default rule connection cap.
@@ -161,6 +165,7 @@ func (err *http3SetupError) Unwrap() error {
 type http3ConnectManager struct {
 	mu                   sync.Mutex
 	observerMu           sync.Mutex
+	logger               *zap.Logger // Immutable after construction, including asynchronous callbacks.
 	transports           map[http3ConnectTransportKey][]*http3ConnectTransportSlot
 	learnedStreamLimits  map[http3ConnectTransportKey]int
 	newTransport         func(http3ConnectTransportKey, context.Context) *http3.Transport
@@ -184,11 +189,22 @@ type http3ConnectManager struct {
 }
 
 func newHTTP3ConnectManager(factory func(http3ConnectTransportKey, context.Context) *http3.Transport) *http3ConnectManager {
+	return newHTTP3ConnectManagerWithLogger(factory, utils.Logger)
+}
+
+func newHTTP3ConnectManagerWithLogger(
+	factory func(http3ConnectTransportKey, context.Context) *http3.Transport,
+	logger *zap.Logger,
+) *http3ConnectManager {
 	dialCtx, cancelDials := context.WithCancel(context.Background())
 	if factory == nil {
 		factory = newHTTP3ConnectTransportWithOwner
 	}
+	if logger == nil {
+		logger = zap.NewNop()
+	}
 	return &http3ConnectManager{
+		logger:              logger,
 		transports:          make(map[http3ConnectTransportKey][]*http3ConnectTransportSlot),
 		learnedStreamLimits: make(map[http3ConnectTransportKey]int),
 		newTransport:        factory,
@@ -224,6 +240,9 @@ func newHTTP3ConnectTransportWithResolver(
 			ServerName: key.serverName,
 		},
 		QUICConfig: &quic.Config{
+			ChromeParrot: true,
+			// The pinned QUIC transport-parameter template advertises v1.
+			Versions:             []quic.Version{quic.Version1},
 			HandshakeIdleTimeout: http3ConnectMaxHandshakeTimeout,
 			MaxIdleTimeout:       http3ConnectIdleTimeout,
 			KeepAlivePeriod:      http3ConnectKeepAlivePeriod,
@@ -257,7 +276,7 @@ func newHTTP3ConnectTransportWithResolver(
 			return nil, context.DeadlineExceeded
 		}
 		dialQUICConfig := cloneHTTP3QUICConfigForSetup(quicConfig, remaining)
-		return quic.DialAddr(dialCtx, resolved, tlsConfig, dialQUICConfig)
+		return dialHTTP3Chrome(dialCtx, resolved, tlsConfig, dialQUICConfig)
 	}
 	return transport
 }
@@ -677,7 +696,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 	if target == nil || target.ConnectProxy == nil {
 		return nil, errors.New("HTTP/3 CONNECT target is not configured")
 	}
-	key := http3ConnectTransportKey{address: target.Address, serverName: target.ConnectProxy.ServerName}
+	key := http3ConnectKey(target)
 	var transport *http3.Transport
 	var transportSlot *http3ConnectTransportSlot
 	var releaseTransport func()
@@ -743,9 +762,7 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		token := base64.StdEncoding.EncodeToString([]byte(auth.Username + ":" + auth.Password))
 		request.Header.Set("Proxy-Authorization", "Basic "+token)
 	}
-	if userAgent, ok := connectProxyUserAgentFromContext(ctx); ok {
-		request.Header.Set("User-Agent", userAgent)
-	}
+	request.Header.Set("User-Agent", connectProxyChromeUserAgent)
 
 	setupFlightSnapshot := transportSlot.setupFlights.snapshot()
 	response, err := transport.RoundTrip(request)
@@ -819,13 +836,11 @@ func (manager *http3ConnectManager) dialWithCandidateRetrySource(
 		return nil, statusErr
 	}
 	ruleName, _ := connectProxyRuleNameFromContext(ctx)
-	userAgent, _ := connectProxyUserAgentFromContext(ctx)
 	tunnelStats := &http3TunnelStats{
 		slot:        transportSlot,
 		ruleName:    ruleName,
 		target:      target,
 		destination: destination,
-		userAgent:   userAgent,
 	}
 	conn := &http3TunnelConn{
 		reader:     response.Body,

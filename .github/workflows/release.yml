@@ -18,13 +18,21 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.25.13
+          go-version: 1.27.2
           cache: true
           cache-dependency-path: go.sum
       - name: Run the complete release gate
         run: |
           make check
           make container-image-check
+      - name: Retain upstream advisory evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-upstream-advisories
+          path: bin/security-advisories/
+          if-no-files-found: warn
+          retention-days: 30
 
   build:
     needs: verify
@@ -48,7 +56,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: 1.25.13
+          go-version: 1.27.2
           cache: true
           cache-dependency-path: go.sum
       - name: Build reproducible release assets
@@ -169,4 +177,13 @@ jobs:
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag --generate-notes --title "${GITHUB_REF_NAME}"
+        run: |
+          set -euo pipefail
+          notes="packaging/release-notes/${GITHUB_REF_NAME}.md"
+          if [[ -f "${notes}" ]]; then
+            gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag \
+              --notes-file "${notes}" --title "${GITHUB_REF_NAME}"
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* --verify-tag \
+              --generate-notes --title "${GITHUB_REF_NAME}"
+          fi
